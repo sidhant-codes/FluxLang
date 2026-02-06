@@ -1,0 +1,891 @@
+"""
+FluxLang — Tree-walk interpreter.
+
+Uses the visitor pattern: ``visit(node)`` dispatches to
+``visit_<NodeType>(node)`` for each AST class.
+"""
+
+from __future__ import annotations
+import os
+import sys
+from typing import Callable
+from . import ast_nodes as ast
+from .environment import Environment
+from .flux_builtins import register_builtins, _builtin_toString
+from .errors import FluxLangError, FluxLangRuntimeError, BreakSignal, ContinueSignal
+from .fluxlang_class import FluxLangClass, FluxLangInstance
+
+# Python recursion limit needed so our own call-depth check always fires first
+_PY_RECURSION_LIMIT = 5000
+
+# Statement-like nodes that trigger the debugger's on_step hook
+_STEP_NODES = frozenset({
+    "VarDecl", "Assign", "AugAssign", "IfStmt", "WhileStmt",
+    "ForStmt", "ForInStmt", "FuncDecl", "ClassDecl",
+    "ReturnStmt", "BreakStmt", "ContinueStmt", "ImportStmt",
+    "TryCatchStmt", "ThrowStmt", "FuncCall", "MethodCall",
+    "ArrayAssign", "DictAssign", "AttributeSet",
+})
+
+
+# ── Sentinel for function returns ────────────────────────────────────
+
+class ReturnSignal(Exception):
+    """Raised inside functions to unwind the call stack and carry the return value."""
+    def __init__(self, value: object = None):
+        self.value = value
+
+
+class FluxLangUserError(FluxLangRuntimeError):
+    """Raised by user 'throw' statement."""
+    def __init__(self, value: object, line: int | None = None, source_line: str = ""):
+        self.value = value
+        msg = value if isinstance(value, str) else str(value)
+        super().__init__(msg, line, source_line)
+
+
+
+# ── FluxLang callable wrapper ────────────────────────────────────────
+
+class FluxFunction:
+    """A user-defined FluxLang function (stores the AST node + closure env)."""
+
+    def __init__(self, decl: ast.FuncDecl, closure: Environment):
+        self.decl = decl
+        self.closure = closure
+
+    def __repr__(self) -> str:
+        return f"<func {self.decl.name}>"
+
+
+# ── Interpreter ──────────────────────────────────────────────────────
+
+class Interpreter:
+    """Tree-walk interpreter for FluxLang ASTs."""
+
+    def __init__(self, *, print_fn=None, input_fn=None, source: str = "",
+                 current_file: str = "", _imported_paths: set | None = None,
+                 on_step=None):
+        """
+        Parameters
+        ----------
+        print_fn : callable, optional
+            Override for ``print()`` — used by the GUI to redirect output.
+        input_fn : callable, optional
+            Override for ``input()`` — used by the GUI to show a dialog instead
+            of reading from stdin.
+        source : str, optional
+            Original source code — used for contextual error messages.
+        current_file : str, optional
+            Absolute path of the file being interpreted.  Used to resolve
+            relative import paths.  Empty string when running inline (GUI/REPL).
+        _imported_paths : set, optional
+            Shared set of already-imported absolute paths.  Passed down through
+            child interpreters to detect circular imports.
+        """
+        if sys.getrecursionlimit() < _PY_RECURSION_LIMIT:
+            sys.setrecursionlimit(_PY_RECURSION_LIMIT)
+
+        self.global_env = Environment()
+        register_builtins(self.global_env)
+
+        # node class → visitor; filled lazily so visitors patched onto the
+        # instance after construction (IDE tracing) are still picked up
+        self._visitors: dict[type, Callable] = {}
+
+        # Source lines for error messages
+        self._source_lines = source.splitlines() if source else []
+
+        # Module system
+        self._current_file    = os.path.abspath(current_file) if current_file else ""
+        self._imported_paths  = _imported_paths if _imported_paths is not None else set()
+
+        # Call-stack depth tracking
+        self._call_depth = 0
+        self._max_depth = 200
+
+        if print_fn is not None:
+            self.global_env.set("print", print_fn)
+
+        if input_fn is not None:
+            self.global_env.set("input", input_fn)
+
+        # Store callbacks so child interpreters (imports) can inherit them
+        self._print_fn = print_fn
+        self._input_fn = input_fn
+        self._on_step = on_step
+
+    # ── source-line helper ───────────────────────────────────────────
+
+    def _get_source_line(self, line_no) -> str:
+        """Return stripped source text for a 1-based line number."""
+        if line_no and 1 <= line_no <= len(self._source_lines):
+            return self._source_lines[line_no - 1].strip()
+        return ""
+
+    # ── public API ───────────────────────────────────────────────────
+
+    def interpret(self, program: ast.Program) -> None:
+        for stmt in program.body:
+            self._exec(stmt, self.global_env)
+
+    # ── dispatch ─────────────────────────────────────────────────────
+
+    def _exec(self, node, env: Environment):
+        cls = type(node)
+        if self._on_step and cls.__name__ in _STEP_NODES and getattr(node, 'line', None):
+            self._on_step(node.line, env)
+
+        visitor = self._visitors.get(cls)
+        if visitor is None:
+            visitor = getattr(self, f"_visit_{cls.__name__}", None)
+            if visitor is None:
+                raise FluxLangRuntimeError(f"Unknown AST node: {cls.__name__}")
+            self._visitors[cls] = visitor
+        return visitor(node, env)
+
+    # ── statements ───────────────────────────────────────────────────
+
+    def _visit_Program(self, node: ast.Program, env: Environment):
+        for stmt in node.body:
+            self._exec(stmt, env)
+
+    def _visit_VarDecl(self, node: ast.VarDecl, env: Environment):
+        value = self._exec(node.value, env)
+        env.set(node.name, value)
+
+    def _visit_Assign(self, node: ast.Assign, env: Environment):
+        value = self._exec(node.value, env)
+        try:
+            env.assign(node.name, value)
+        except FluxLangRuntimeError:
+            raise FluxLangRuntimeError(
+                f"Cannot assign to undefined variable: '{node.name}'",
+                node.line, self._get_source_line(node.line),
+            )
+
+    def _visit_AugAssign(self, node: ast.AugAssign, env: Environment):
+        """Handle  x += expr ;  etc."""
+        try:
+            current = env.get(node.name)
+        except FluxLangRuntimeError:
+            raise FluxLangRuntimeError(
+                f"Undefined variable: '{node.name}'",
+                node.line, self._get_source_line(node.line),
+            )
+        new_val = self._exec(node.value, env)
+        if node.op == "+":
+            if isinstance(current, str) or isinstance(new_val, str):
+                result = _builtin_toString(current) + _builtin_toString(new_val)
+            else:
+                result = current + new_val
+        elif node.op == "-":
+            result = current - new_val
+        elif node.op == "*":
+            result = current * new_val
+        elif node.op == "/":
+            if new_val == 0:
+                raise FluxLangRuntimeError("Division by zero", node.line,
+                                           self._get_source_line(node.line))
+            result = current / new_val
+        elif node.op == "//":  # FIXED: added //= augmented floor-div support
+            if new_val == 0:
+                raise FluxLangRuntimeError("Division by zero", node.line,
+                                           self._get_source_line(node.line))
+            result = current // new_val
+        elif node.op == "%":   # FIXED: added %= augmented modulo support
+            if new_val == 0:
+                raise FluxLangRuntimeError("Modulo by zero", node.line,
+                                           self._get_source_line(node.line))
+            result = current % new_val
+        else:
+            raise FluxLangRuntimeError(f"Unknown augmented operator: {node.op}", node.line)
+        env.assign(node.name, result)
+
+    def _visit_IfStmt(self, node: ast.IfStmt, env: Environment):
+        if self._truthy(self._exec(node.condition, env)):
+            return self._exec(node.body, env)
+        for cond, body in node.elif_clauses:
+            if self._truthy(self._exec(cond, env)):
+                return self._exec(body, env)
+        if node.else_body is not None:
+            return self._exec(node.else_body, env)
+
+    def _visit_WhileStmt(self, node: ast.WhileStmt, env: Environment):
+        broke = False
+        try:
+            while self._truthy(self._exec(node.condition, env)):
+                try:
+                    self._exec(node.body, env)
+                except BreakSignal:
+                    broke = True
+                    break
+                except ContinueSignal:
+                    continue
+        finally:
+            # else runs only if loop completed normally (no break)
+            if not broke and node.else_body is not None:
+                self._exec(node.else_body, env)
+            # finally always runs
+            if node.finally_body is not None:
+                self._exec(node.finally_body, env)
+
+    def _visit_ForStmt(self, node: ast.ForStmt, env: Environment):
+        loop_env = Environment(parent=env)
+        self._exec(node.init, loop_env)
+        broke = False
+        try:
+            while self._truthy(self._exec(node.condition, loop_env)):
+                try:
+                    self._exec(node.body, loop_env)
+                except BreakSignal:
+                    broke = True
+                    break
+                except ContinueSignal:
+                    pass  # fall through to update (correct for-loop continue)
+                self._exec(node.update, loop_env)
+        finally:
+            if not broke and node.else_body is not None:
+                self._exec(node.else_body, loop_env)
+            if node.finally_body is not None:
+                self._exec(node.finally_body, loop_env)
+
+    def _visit_ForInStmt(self, node: ast.ForInStmt, env: Environment):
+        iterable = self._exec(node.iterable, env)
+        if isinstance(iterable, dict):
+            iterable = list(iterable)  # keys; snapshot so the body may modify the dict
+        elif not isinstance(iterable, (list, str)):
+            raise FluxLangRuntimeError(
+                "for...in loop requires an array, string, or dict", node.line,
+                self._get_source_line(node.line),
+            )
+        broke = False
+        try:
+            for item in iterable:
+                loop_env = Environment(parent=env)
+                loop_env.set(node.var, item)
+                try:
+                    self._exec(node.body, loop_env)
+                except BreakSignal:
+                    broke = True
+                    break
+                except ContinueSignal:
+                    continue
+        finally:
+            if not broke and node.else_body is not None:
+                self._exec(node.else_body, env)
+            if node.finally_body is not None:
+                self._exec(node.finally_body, env)
+
+    def _visit_FuncDecl(self, node: ast.FuncDecl, env: Environment):
+        fn = FluxFunction(node, closure=env)
+        env.set(node.name, fn)
+
+    def _visit_ReturnStmt(self, node: ast.ReturnStmt, env: Environment):
+        value = None
+        if node.value is not None:
+            value = self._exec(node.value, env)
+        raise ReturnSignal(value)
+
+    def _visit_BreakStmt(self, node: ast.BreakStmt, env: Environment):
+        raise BreakSignal()
+
+    def _visit_ContinueStmt(self, node: ast.ContinueStmt, env: Environment):
+        raise ContinueSignal()
+
+    def _visit_ImportStmt(self, node: ast.ImportStmt, env: Environment):
+        """Load, lex, parse, and run an external .flux file.
+
+        Resolution order (first match wins)
+        ------------------------------------
+        1. Relative to the *importing file's own directory*  (set by CLI / GUI
+           open-file).
+        2. Relative to the current working directory  (fallback for GUI inline
+           code or scripts run from a different directory).
+        3. Relative to the FluxLang project root  (the directory that contains
+           interpreter.py — useful for ``import "lib/math.flux"`` regardless
+           of where the user's script lives).
+
+        Semantics
+        ---------
+        - The imported file runs in a **fresh** Environment so its local
+          variables don't accidentally pollute the caller.
+        - Every top-level name the module defines is merged into ``env``
+          after execution, making them available to the importer.
+        - Each file is executed **at most once** per interpreter session
+          (circular imports are silently skipped after the first load).
+        """
+        from .lexer import Lexer as _Lex
+        from .parser import Parser as _Par
+        from .flux_builtins import BUILTINS
+
+        # ── 1. Build the search path ────────────────────────────────────
+        # FluxLang package root = directory containing fluxlang package
+        _core_dir = os.path.dirname(os.path.abspath(__file__))
+        _pkg_dir  = os.path.dirname(_core_dir)
+        _proj_dir = os.path.dirname(_pkg_dir)
+
+        candidate_bases: list[str] = []
+        if self._current_file:
+            candidate_bases.append(os.path.dirname(self._current_file))
+        candidate_bases.extend([os.getcwd(), _proj_dir, _pkg_dir, _core_dir])
+
+        # Deduplicate while preserving order
+        seen_norm: set[str] = set()
+        unique_bases: list[str] = []
+        for b in candidate_bases:
+            nb = os.path.normcase(os.path.abspath(b))
+            if nb not in seen_norm:
+                seen_norm.add(nb)
+                unique_bases.append(b)
+
+        # Strip leading ../ segments to build a "project-relative" fallback
+        # e.g.  "../lib/math.flux"  → "lib/math.flux"
+        parts = node.path.replace("\\", "/").split("/")
+        stripped_parts = [p for p in parts if p not in ("", "..")]
+        stripped_path = "/".join(stripped_parts)  # "" if path was all ../
+
+        def _candidates_for(base: str):
+            """Yield (path_str, file_path) pairs to try for one base."""
+            yield node.path, os.path.normpath(os.path.join(base, node.path))
+            if stripped_path and stripped_path != node.path:
+                yield stripped_path, os.path.normpath(
+                    os.path.join(base, stripped_path)
+                )
+
+        # Try each base with both the raw and stripped paths
+        abs_path: str | None = None
+        tried_all: list[str] = []
+        for base in unique_bases:
+            for _label, candidate in _candidates_for(base):
+                tried_all.append(candidate)
+                if os.path.isfile(candidate):
+                    abs_path = candidate
+                    break
+            if abs_path is not None:
+                break
+
+        if abs_path is None:
+            # De-dup for the error message (preserve order)
+            seen_t: set[str] = set()
+            unique_tried: list[str] = []
+            for p in tried_all:
+                np = os.path.normcase(p)
+                if np not in seen_t:
+                    seen_t.add(np)
+                    unique_tried.append(p)
+            raise FluxLangRuntimeError(
+                f"import: file not found — {node.path!r}\n"
+                f"  Searched:\n" +
+                "\n".join(f"    {p!r}" for p in unique_tried),
+                node.line, self._get_source_line(node.line),
+            )
+
+        # ── 2. Circular / duplicate import guard ────────────────────────
+        norm_path = os.path.normcase(abs_path)
+        if norm_path in self._imported_paths:
+            return  # already loaded — skip silently
+        self._imported_paths.add(norm_path)
+
+        # ── 3. Read the module source ───────────────────────────────────
+        try:
+            with open(abs_path, "r", encoding="utf-8") as fh:
+                source = fh.read()
+        except OSError as exc:
+            raise FluxLangRuntimeError(
+                f"import: cannot read {abs_path!r}: {exc}",
+                node.line, self._get_source_line(node.line),
+            )
+
+        # ── 4. Lex + parse ──────────────────────────────────────────────
+        tokens = _Lex(source).tokenize()
+        tree   = _Par(tokens).parse()
+
+        # ── 5. Run in an isolated child interpreter ─────────────────────
+        child = Interpreter(
+            source=source,
+            current_file=abs_path,
+            _imported_paths=self._imported_paths,   # shared — prevents re-import
+            print_fn=self._print_fn,
+            input_fn=self._input_fn,
+        )
+        child.interpret(tree)
+
+        # ── 6. Merge exports into caller's env ──────────────────────────
+        builtin_names = set(BUILTINS.keys())
+        for name, value in child.global_env._store.items():
+            if name not in builtin_names:   # don't clobber built-ins
+                env.set(name, value)
+
+    def _visit_Block(self, node: ast.Block, env: Environment):
+        block_env = Environment(parent=env)
+        for stmt in node.statements:
+            self._exec(stmt, block_env)
+
+    def _visit_ThrowStmt(self, node: ast.ThrowStmt, env: Environment):
+        val = self._exec(node.value, env)
+        raise FluxLangUserError(val, node.line, self._get_source_line(node.line))
+
+    def _visit_TryCatchStmt(self, node: ast.TryCatchStmt, env: Environment):
+        try:
+            try:
+                self._exec(node.try_body, env)
+            except (ReturnSignal, BreakSignal, ContinueSignal):
+                raise
+            except (FluxLangError, RecursionError) as e:
+                if node.catch_body is not None:
+                    catch_env = Environment(parent=env)
+                    if node.catch_var:
+                        if isinstance(e, RecursionError):
+                            err_val = "Stack overflow"
+                        else:
+                            err_val = getattr(e, "value", e.message)
+                        catch_env.set(node.catch_var, err_val)
+                    self._exec(node.catch_body, catch_env)
+                else:
+                    raise
+        finally:
+            if node.finally_body is not None:
+                self._exec(node.finally_body, env)
+
+    # ── class statements ─────────────────────────────────────────────
+
+    def _visit_ClassDecl(self, node: ast.ClassDecl, env: Environment):
+        parent = None
+        if node.parent is not None:
+            try:
+                parent = env.get(node.parent)
+            except FluxLangRuntimeError:
+                raise FluxLangRuntimeError(
+                    f"Undefined parent class: '{node.parent}'",
+                    node.line, self._get_source_line(node.line),
+                )
+            if not isinstance(parent, FluxLangClass):
+                raise FluxLangRuntimeError(
+                    f"'{node.parent}' is not a class", node.line,
+                )
+        methods = {m.name: m for m in node.methods}
+        klass = FluxLangClass(name=node.name, parent=parent, methods=methods)
+        env.set(node.name, klass)
+
+    # ── expressions ──────────────────────────────────────────────────
+
+    def _visit_Literal(self, node: ast.Literal, _env: Environment):
+        return node.value
+
+    def _visit_Identifier(self, node: ast.Identifier, env: Environment):
+        try:
+            return env.get(node.name)
+        except FluxLangRuntimeError:
+            raise FluxLangRuntimeError(
+                f"Undefined variable: '{node.name}'",
+                node.line, self._get_source_line(node.line),
+            )
+
+    def _visit_SelfExpr(self, node: ast.SelfExpr, env: Environment):
+        try:
+            return env.get("self")
+        except FluxLangRuntimeError:
+            raise FluxLangRuntimeError(
+                "'self' used outside of a class method",
+                node.line, self._get_source_line(node.line),
+            )
+
+    def _visit_UnaryOp(self, node: ast.UnaryOp, env: Environment):
+        operand = self._exec(node.operand, env)
+        if node.op == "-":
+            return -operand
+        if node.op == "not":
+            return not self._truthy(operand)
+        raise FluxLangRuntimeError(f"Unknown unary operator: {node.op}", node.line)
+
+    def _visit_BinOp(self, node: ast.BinOp, env: Environment):
+        # FIXED: documented that and/or return the last evaluated value
+        # (Python-style short-circuit), NOT a boolean.  e.g.:
+        #   0 and "hi"  → 0      (falsy left returned)
+        #   1 and "hi"  → "hi"   (right returned)
+        #   0 or  "hi"  → "hi"   (right returned)
+        #   1 or  "hi"  → 1      (truthy left returned)
+        if node.op == "and":
+            left = self._exec(node.left, env)
+            return self._exec(node.right, env) if self._truthy(left) else left
+        if node.op == "or":
+            left = self._exec(node.left, env)
+            return left if self._truthy(left) else self._exec(node.right, env)
+
+        left = self._exec(node.left, env)
+        right = self._exec(node.right, env)
+
+        try:
+            match node.op:
+                case "+":
+                    if isinstance(left, str) or isinstance(right, str):
+                        return _builtin_toString(left) + _builtin_toString(right)
+                    return left + right
+                case "-":  return left - right
+                case "*":  return left * right
+                case "/":
+                    if right == 0:
+                        raise FluxLangRuntimeError("Division by zero", node.line,
+                                                   self._get_source_line(node.line))
+                    return left / right        # always true division
+                case "//":
+                    if right == 0:
+                        raise FluxLangRuntimeError("Division by zero", node.line,
+                                                   self._get_source_line(node.line))
+                    return left // right        # floor (integer) division
+                case "%":
+                    if right == 0:
+                        raise FluxLangRuntimeError("Modulo by zero", node.line,
+                                                   self._get_source_line(node.line))
+                    return left % right
+                case "**": return left ** right
+                case "==": return left == right
+                case "!=": return left != right
+                case "<":  return left < right
+                case ">":  return left > right
+                case "<=": return left <= right
+                case ">=": return left >= right
+                case _:
+                    raise FluxLangRuntimeError(f"Unknown operator: {node.op}", node.line)
+        except TypeError as e:
+            raise FluxLangRuntimeError(
+                f"Type error in '{node.op}': {e}",
+                node.line, self._get_source_line(node.line),
+            )
+
+    def _visit_FuncCall(self, node: ast.FuncCall, env: Environment):
+        try:
+            callee = env.get(node.name)
+        except FluxLangRuntimeError:
+            raise FluxLangRuntimeError(
+                f"Undefined function: '{node.name}'",
+                node.line, self._get_source_line(node.line),
+            )
+        args = [self._exec(arg, env) for arg in node.args]
+
+        # Class instantiation
+        if isinstance(callee, FluxLangClass):
+            return self._instantiate(callee, args, node.line)
+
+        # Python callable (built-in)
+        if callable(callee) and not isinstance(callee, FluxFunction):
+            try:
+                return callee(*args)
+            except (TypeError, ValueError, KeyError, IndexError) as e:
+                raise FluxLangRuntimeError(str(e), node.line, self._get_source_line(node.line))
+
+        # User-defined function
+        if isinstance(callee, FluxFunction):
+            return self._call_function(callee, args, node.line)
+
+        raise FluxLangRuntimeError(f"'{node.name}' is not callable", node.line)
+
+    def _visit_LambdaExpr(self, node: ast.LambdaExpr, env: Environment):
+        """Evaluate func(params){body} in expression position → a FluxFunction value.
+
+        The current environment is captured as the closure so the lambda
+        can close over local variables:
+            let x = 10;
+            let add_x = func(n) { return n + x; };
+            add_x(5)   # → 15
+        """
+        # Build a synthetic FuncDecl with a placeholder name so FluxFunction
+        # can be called by _call_function without any changes.
+        synthetic_decl = ast.FuncDecl(
+            name="<lambda>",
+            params=node.params,
+            body=node.body,
+            variadic=node.variadic,
+            line=node.line,
+        )
+        return FluxFunction(synthetic_decl, closure=env)
+
+    def _visit_CallExpr(self, node: ast.CallExpr, env: Environment):
+        """Call an arbitrary expression value as a function.
+
+        Handles:
+          - makeAdder(5)(10)  — chain of calls
+          - funcs[0](x)       — function stored in array
+          - getCallback()()   — function returned by a call
+          - (func(x){return x*2;})(7)  — immediately-invoked lambda
+        """
+        callee = self._exec(node.callee, env)
+        args = [self._exec(arg, env) for arg in node.args]
+
+        if isinstance(callee, FluxLangClass):
+            return self._instantiate(callee, args, node.line)
+        if isinstance(callee, FluxFunction):
+            return self._call_function(callee, args, node.line)
+        if callable(callee):
+            try:
+                return callee(*args)
+            except (TypeError, ValueError, KeyError, IndexError) as e:
+                raise FluxLangRuntimeError(str(e), node.line, self._get_source_line(node.line))
+        raise FluxLangRuntimeError(
+            f"Expression is not callable (got {type(callee).__name__})", node.line,
+        )
+
+    # ── array expressions ────────────────────────────────────────────
+
+    def _visit_ArrayLiteral(self, node: ast.ArrayLiteral, env: Environment):
+        return [self._exec(elem, env) for elem in node.elements]
+
+    def _visit_ArrayIndex(self, node: ast.ArrayIndex, env: Environment):
+        array = self._exec(node.array, env)
+        index = self._exec(node.index, env)
+        # ── dict read: any hashable key ─────────────────────────────
+        if isinstance(array, dict):
+            if index not in array:
+                raise FluxLangRuntimeError(
+                    f"Key {index!r} not found in dict", node.line,
+                    self._get_source_line(node.line),
+                )
+            return array[index]
+        # ── string indexing ─────────────────────────────────────────
+        if isinstance(array, str):
+            if not isinstance(index, int):
+                raise FluxLangRuntimeError("String index must be an integer", node.line)
+            try:
+                return array[index]
+            except IndexError:
+                raise FluxLangRuntimeError(
+                    f"String index {index} out of range (length {len(array)})", node.line,
+                )
+        # ── array indexing ──────────────────────────────────────────
+        if not isinstance(array, list):
+            raise FluxLangRuntimeError("Indexing requires an array, dict, or string", node.line)
+        if not isinstance(index, int):
+            raise FluxLangRuntimeError("Array index must be an integer", node.line)
+        try:
+            return array[index]
+        except IndexError:
+            raise FluxLangRuntimeError(
+                f"Array index {index} out of range (length {len(array)})", node.line,
+            )
+
+    def _visit_ArrayAssign(self, node: ast.ArrayAssign, env: Environment):
+        array = self._exec(node.array, env)
+        index = self._exec(node.index, env)
+        value = self._exec(node.value, env)
+        # ── dict write: any hashable key ────────────────────────────
+        if isinstance(array, dict):
+            array[index] = value
+            return
+        # ── array write ─────────────────────────────────────────────
+        if not isinstance(array, list):
+            raise FluxLangRuntimeError("Index assignment requires an array or dict", node.line)
+        if not isinstance(index, int):
+            raise FluxLangRuntimeError("Array index must be an integer", node.line)
+        try:
+            array[index] = value
+        except IndexError:
+            raise FluxLangRuntimeError(
+                f"Array index {index} out of range (length {len(array)})", node.line,
+            )
+
+    # ── dict expressions ──────────────────────────────────────────────
+
+    def _visit_DictLiteral(self, node: ast.DictLiteral, env: Environment):
+        result = {}
+        for k_node, v_node in zip(node.keys, node.values):
+            key = self._exec(k_node, env)
+            val = self._exec(v_node, env)
+            result[key] = val
+        return result
+
+    def _visit_DictIndex(self, node: ast.DictIndex, env: Environment):
+        """Explicit DictIndex node (future use; currently dict access uses ArrayIndex)."""
+        d = self._exec(node.obj, env)
+        key = self._exec(node.key, env)
+        if not isinstance(d, dict):
+            raise FluxLangRuntimeError("Expected a dict", node.line)
+        if key not in d:
+            raise FluxLangRuntimeError(f"Key {key!r} not found in dict", node.line)
+        return d[key]
+
+    def _visit_DictAssign(self, node: ast.DictAssign, env: Environment):
+        """Explicit DictAssign node (future use; currently dict write uses ArrayAssign)."""
+        d = self._exec(node.obj, env)
+        key = self._exec(node.key, env)
+        val = self._exec(node.value, env)
+        if not isinstance(d, dict):
+            raise FluxLangRuntimeError("Expected a dict", node.line)
+        d[key] = val
+
+    def _visit_ArraySlice(self, node: ast.ArraySlice, env: Environment):
+        array = self._exec(node.array, env)
+        start = self._exec(node.start, env) if node.start is not None else None
+        stop = self._exec(node.stop, env) if node.stop is not None else None
+        if not isinstance(array, (list, str)):
+            raise FluxLangRuntimeError("Slicing requires an array or string", node.line)
+        return array[start:stop]
+
+    # ── OOP expressions ──────────────────────────────────────────────
+
+    def _visit_AttributeGet(self, node: ast.AttributeGet, env: Environment):
+        obj = self._exec(node.obj, env)
+        if isinstance(obj, FluxLangInstance):
+            try:
+                return obj.get(node.attr)
+            except AttributeError:
+                raise FluxLangRuntimeError(
+                    f"'{obj.klass.name}' object has no attribute '{node.attr}'",
+                    node.line, self._get_source_line(node.line),
+                )
+        raise FluxLangRuntimeError(
+            f"Cannot read attribute '{node.attr}' on non-object", node.line,
+        )
+
+    def _visit_AttributeSet(self, node: ast.AttributeSet, env: Environment):
+        obj = self._exec(node.obj, env)
+        value = self._exec(node.value, env)
+        if isinstance(obj, FluxLangInstance):
+            obj.set(node.attr, value)
+            return
+        raise FluxLangRuntimeError(
+            f"Cannot set attribute '{node.attr}' on non-object", node.line,
+        )
+
+    def _visit_MethodCall(self, node: ast.MethodCall, env: Environment):
+        obj = self._exec(node.obj, env)
+        if not isinstance(obj, FluxLangInstance):
+            raise FluxLangRuntimeError(
+                f"Cannot call method '{node.method}' on non-object", node.line,
+            )
+        method_decl = obj.klass.find_method(node.method)
+        if method_decl is None:
+            raise FluxLangRuntimeError(
+                f"'{obj.klass.name}' object has no method '{node.method}'",
+                node.line, self._get_source_line(node.line),
+            )
+        args = [self._exec(arg, env) for arg in node.args]
+        n_fixed = len(method_decl.params)
+        has_variadic = method_decl.variadic is not None
+        if has_variadic:
+            if len(args) < n_fixed:
+                raise FluxLangRuntimeError(
+                    f"Method '{node.method}' expects at least {n_fixed} "
+                    f"argument(s), got {len(args)}", node.line,
+                )
+        else:
+            if len(args) != n_fixed:
+                raise FluxLangRuntimeError(
+                    f"Method '{node.method}' expects {n_fixed} "
+                    f"argument(s), got {len(args)}", node.line,
+                )
+        # Call with depth tracking
+        self._call_depth += 1
+        if self._call_depth > self._max_depth:
+            self._call_depth = 0
+            raise FluxLangRuntimeError(
+                f"Stack overflow: maximum call depth ({self._max_depth}) exceeded",
+                node.line, self._get_source_line(node.line),
+            )
+        try:
+            method_env = Environment(parent=self.global_env)
+            method_env.set("self", obj)
+            for param, arg in zip(method_decl.params, args):
+                method_env.set(param, arg)
+            if has_variadic:
+                method_env.set(method_decl.variadic, list(args[n_fixed:]))
+            try:
+                self._exec(method_decl.body, method_env)
+            except ReturnSignal as ret:
+                return ret.value
+            return None
+        finally:
+            self._call_depth -= 1
+
+    # ── helper: call a FluxFunction (with depth tracking) ────────────
+
+    def _call_function(self, fn: FluxFunction, args: list, line: int):
+        decl = fn.decl
+        n_fixed = len(decl.params)
+
+        # ── arity check ────────────────────────────────────────────────
+        if decl.variadic is None:
+            if len(args) != n_fixed:
+                raise FluxLangRuntimeError(
+                    f"Function '{decl.name}' expects {n_fixed} argument(s), "
+                    f"got {len(args)}", line,
+                )
+        else:
+            if len(args) < n_fixed:
+                raise FluxLangRuntimeError(
+                    f"Function '{decl.name}' expects at least {n_fixed} "
+                    f"argument(s), got {len(args)}", line,
+                )
+
+        self._call_depth += 1
+        if self._call_depth > self._max_depth:
+            self._call_depth = 0
+            raise FluxLangRuntimeError(
+                f"Stack overflow: maximum call depth ({self._max_depth}) exceeded",
+                line, self._get_source_line(line),
+            )
+        try:
+            call_env = Environment(parent=fn.closure)
+            # bind fixed params
+            for param, arg in zip(decl.params, args):
+                call_env.set(param, arg)
+            # bind variadic param (pack remaining args into a list)
+            if decl.variadic is not None:
+                call_env.set(decl.variadic, list(args[n_fixed:]))
+            try:
+                self._exec(decl.body, call_env)
+            except ReturnSignal as ret:
+                return ret.value
+            return None
+        finally:
+            self._call_depth -= 1
+
+    # ── helper: instantiate a class (with depth tracking) ────────────
+
+    def _instantiate(self, klass: FluxLangClass, args: list, line: int):
+        instance = FluxLangInstance(klass)
+        init_method = klass.find_method("init")
+        if init_method is not None:
+            if len(args) != len(init_method.params):
+                raise FluxLangRuntimeError(
+                    f"Class '{klass.name}' init() expects {len(init_method.params)} "
+                    f"argument(s), got {len(args)}", line,
+                )
+            self._call_depth += 1
+            if self._call_depth > self._max_depth:
+                self._call_depth = 0
+                raise FluxLangRuntimeError(
+                    f"Stack overflow: maximum call depth ({self._max_depth}) exceeded",
+                    line, self._get_source_line(line),
+                )
+            try:
+                init_env = Environment(parent=self.global_env)
+                init_env.set("self", instance)
+                for param, arg in zip(init_method.params, args):
+                    init_env.set(param, arg)
+                try:
+                    self._exec(init_method.body, init_env)
+                except ReturnSignal:
+                    pass
+            finally:
+                self._call_depth -= 1
+        else:
+            if args:
+                raise FluxLangRuntimeError(
+                    f"Class '{klass.name}' has no init() but received arguments", line,
+                )
+        return instance
+
+    # ── helpers ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _truthy(value: object) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            return len(value) > 0
+        return True
