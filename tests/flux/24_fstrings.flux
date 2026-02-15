@@ -1,0 +1,8 @@
+let name = "FluxLang";
+let version = 1;
+let pi = 3.14;
+let flag = true;
+print(f"Hello from {name}!");
+print(f"Version: {version}");
+print(f"Pi is approximately {pi}");
+print(f"Active: {flag}");
