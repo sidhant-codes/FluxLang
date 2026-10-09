@@ -3,7 +3,7 @@
   <p><strong>A lightweight, multi-paradigm dynamic programming language with an AST interpreter & custom IDE.</strong></p>
 
 [![Python Version](https://img.shields.io/badge/python-3.10+-3776AB.svg?style=flat&logo=python&logoColor=white)](https://www.python.org/downloads/)
-[![CI](https://github.com/Divyansh3105/FluxLang/actions/workflows/ci.yml/badge.svg)](https://github.com/Divyansh3105/FluxLang/actions/workflows/ci.yml)
+[![CI](https://github.com/sidhant-codes/FluxLang/actions/workflows/ci.yml/badge.svg)](https://github.com/sidhant-codes/FluxLang/actions/workflows/ci.yml)
 [![Type Checked](https://img.shields.io/badge/pyright-clean-blue.svg?style=flat)]()
 [![License](https://img.shields.io/badge/license-MIT-green.svg?style=flat)](LICENSE)
 
@@ -90,7 +90,7 @@ The IDE includes several ready-to-run demo applications located in `demos/`:
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/Divyansh3105/FluxLang.git
+   git clone https://github.com/sidhant-codes/FluxLang.git
    cd FluxLang
    ```
 
@@ -211,7 +211,7 @@ FluxLang follows a clean, modular pipeline:
 
 ## 📖 Documentation
 
-Full documentation and syntax guides are available on the **[FluxLang Docs Site](https://divyansh3105.github.io/FluxLang/)** (built using MkDocs Material).
+Full documentation and syntax guides are available on the **[FluxLang Docs Site](https://sidhant-codes.github.io/FluxLang/)** (built using MkDocs Material).
 
 To view documentation locally:
 ```bash
@@ -223,18 +223,10 @@ mkdocs serve
 
 ## 👨‍💻 Authors
 
-### Divyansh Garg
+### Sidhant Bisht
 
-🌐 Portfolio: divyansh3105.github.io/Portfolio  
-💼 LinkedIn: linkedin.com/in/divyanshgarg3105  
-💻 GitHub: @Divyansh3105
-
-### Utkarsh Negi
-
-💼 LinkedIn: linkedin.com/in/negiutkarsh
-
-💻 GitHub: @UtkarshNegi01
-
+💼 LinkedIn: www.linkedin.com/in/sidhant-bisht-809016264
+💻 GitHub: @sidhant-codes
 ---
 
 ## 📜 License
